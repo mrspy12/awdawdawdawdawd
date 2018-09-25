@@ -2735,6 +2735,7 @@ static int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 		VERIFY(err, cid < NUM_CHANNELS);
 		if (err)
 			goto bail;
+#if 0
 		/* Check to see if the device node is non-secure */
 		if (fl->dev_minor == MINOR_NUM_DEV) {
 			/*
@@ -2752,6 +2753,7 @@ static int fastrpc_get_info(struct fastrpc_file *fl, uint32_t *info)
 				goto bail;
 			}
 		}
+#endif
 		fl->cid = cid;
 		fl->ssrcount = fl->apps->channel[cid].ssrcount;
 		VERIFY(err, !fastrpc_session_alloc_locked(
