@@ -332,7 +332,7 @@ static struct class_attribute pl_attributes[] = {
  *  TAPER  *
 ************/
 #define MINIMUM_PARALLEL_FCC_UA		500000
-#define PL_TAPER_WORK_DELAY_MS		100
+#define PL_TAPER_WORK_DELAY_MS		500
 #define TAPER_RESIDUAL_PCT		75
 static void pl_taper_work(struct work_struct *work)
 {
@@ -390,9 +390,6 @@ done:
  *  FCC  *
 **********/
 #define EFFICIENCY_PCT	80
-#if defined(CONFIG_NUBIA_CHARGE_FEATURE)
-#define MIN_SPLIT_CHANGE_CURRENT_UA		300000
-#endif
 #define FCC_STEP_SIZE_UA 100000
 #define FCC_STEP_UPDATE_DELAY_MS 1000
 #define STEP_UP 1
@@ -441,21 +438,12 @@ static void get_fcc_split(struct pl_data *chip, int total_ua,
 	 * charger's current goes through main charger's BATFET, keep
 	 * the main charger's FCC to the votable result.
 	 */
-#if defined(CONFIG_NUBIA_CHARGE_FEATURE)
-	*slave_ua = (*slave_ua * chip->taper_pct) / 100;
-	*slave_ua = min(*slave_ua, total_ua - MIN_SPLIT_CHANGE_CURRENT_UA);
-	if (chip->pl_mode == POWER_SUPPLY_PL_USBIN_USBIN)
-		*master_ua = max(MIN_SPLIT_CHANGE_CURRENT_UA, total_ua);
-	else
-		*master_ua = max(MIN_SPLIT_CHANGE_CURRENT_UA, total_ua - *slave_ua);
-#else
 	if (chip->pl_mode == POWER_SUPPLY_PL_USBIN_USBIN)
 		*master_ua = max(0, total_ua);
 	else
 		*master_ua = max(0, total_ua - *slave_ua);
 
 	*slave_ua = (*slave_ua * chip->taper_pct) / 100;
-#endif
 }
 
 static void get_fcc_step_update_params(struct pl_data *chip, int main_fcc_ua,
@@ -550,10 +538,6 @@ static int pl_fcc_vote_callback(struct votable *votable, void *data,
 	}
 
 	if (chip->pl_mode != POWER_SUPPLY_PL_NONE) {
-#if defined(CONFIG_NUBIA_CHARGE_FEATURE)
-		if(total_fcc_ua >= MIN_SPLIT_CHANGE_CURRENT_UA) {
-			get_fcc_split(chip, total_fcc_ua, &master_fcc_ua, &slave_fcc_ua);
-#else
 		get_fcc_split(chip, total_fcc_ua,
 			&master_fcc_ua, &slave_fcc_ua);
 		if (chip->fcc_step_update) {
@@ -562,8 +546,7 @@ static int pl_fcc_vote_callback(struct votable *votable, void *data,
 			get_fcc_step_update_params(chip, master_fcc_ua,
 					slave_fcc_ua);
 			schedule_delayed_work(&chip->fcc_step_update_work, 0);
-#endif
-		} else {	
+		} else {
 			/*
 			 * If there is an increase in slave share
 			 * (Also handles parallel enable case)
@@ -615,7 +598,6 @@ static int pl_fcc_vote_callback(struct votable *votable, void *data,
 					pr_err("Could not set main fcc, rc=%d\n",
 						rc);
 					return rc;
-
 				}
 			}
 		}

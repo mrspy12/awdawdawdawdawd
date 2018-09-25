@@ -25,7 +25,6 @@
 #include "battery.h"
 #include "step-chg-jeita.h"
 #include "storm-watch.h"
-#include <linux/of_gpio.h>
 
 #define smblib_err(chg, fmt, ...)		\
 	pr_err("%s: %s: " fmt, chg->name,	\
@@ -41,10 +40,6 @@
 				__func__, ##__VA_ARGS__);	\
 	} while (0)
 
-#define BOOST_BACK_UNVOTE_DELAY_MS		750
-#define BOOST_BACK_STORM_COUNT			3
-#define WEAK_CHG_STORM_COUNT			8 
-    
 static bool is_secure(struct smb_charger *chg, int addr)
 {
 	if (addr == SHIP_MODE_REG || addr == FREQ_CLK_DIV_REG)
@@ -258,29 +253,6 @@ static const struct apsd_result *smblib_get_apsd_result(struct smb_charger *chg)
 	u8 apsd_stat, stat;
 	const struct apsd_result *result = &smblib_apsd_results[UNKNOWN];
 
-#if defined(CONFIG_NEO_DIRECT_CHARGE_SUPPORT)
-	rc = smblib_read(chg, PMI_GPIO3_STATUS, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read INT_RT_STS_OFFSET rc=%d\n",
-			rc);
-		return result;
-	}
-	if (stat & PMI_GPIO3_VAL_MASK){
-		result = &smblib_apsd_results[DCP];
-		return result;
-	}
-
-	rc = smblib_read(chg, USBIN_BASE + INT_RT_STS_OFFSET, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
-		return result;
-	}
-	if (!(stat & USBIN_PLUGIN_RT_STS_BIT) && !chg->direct_irq_disabled){
-		chg->real_charger_type = POWER_SUPPLY_TYPE_UNKNOWN;
-		return result;
-	}
-#endif
-
 	rc = smblib_read(chg, APSD_STATUS_REG, &apsd_stat);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read APSD_STATUS rc=%d\n", rc);
@@ -402,30 +374,6 @@ int smblib_set_charge_param(struct smb_charger *chg,
 	return rc;
 }
 
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-static int step_charge_soc_update(struct smb_charger *chg, int capacity)
-{
-	int rc = 0;
-
-	rc = smblib_set_charge_param(chg, &chg->param.step_soc, capacity);
-	if (rc < 0) {
-		smblib_err(chg, "Error in updating soc, rc=%d\n", rc);
-		return rc;
-	}
-
-	rc = smblib_write(chg, STEP_CHG_SOC_VBATT_V_UPDATE_REG,
-			STEP_CHG_SOC_VBATT_V_UPDATE_BIT);
-	if (rc < 0) {
-		smblib_err(chg,
-			"Couldn't set STEP_CHG_SOC_VBATT_V_UPDATE_REG rc=%d\n",
-			rc);
-		return rc;
-	}
-
-	return rc;
-}
-#endif
-
 int smblib_set_usb_suspend(struct smb_charger *chg, bool suspend)
 {
 	int rc = 0;
@@ -539,80 +487,6 @@ static int smblib_set_usb_pd_allowed_voltage(struct smb_charger *chg,
 	return rc;
 }
 
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-#define STEP_CHARGING_MAX_STEPS	5
-int smblib_config_step_charging(struct smb_charger *chg, int enable)
-{
-	int rc = 0;
-	int i;
-
-	if(chg->mode != PARALLEL_MASTER)
-		return rc;
-
-	smblib_dbg(chg, PR_INTERRUPT, "Step charging has been %sd.\n", enable ? "enable" : "disable");
-	chg->step_chg_enabled = enable;
-
-	if(!chg->step_chg_enabled)
-		return rc;
-
-	for (i = 0; i < STEP_CHARGING_MAX_STEPS - 1; i++) {
-		rc = smblib_set_charge_param(chg,
-					     &chg->param.step_soc_threshold[i],
-					     chg->step_soc_threshold[i]);
-		if (rc < 0) {
-			pr_err("Couldn't configure soc thresholds rc = %d\n",
-				rc);
-			goto err_out;
-		}
-	}
-
-	for (i = 0; i < STEP_CHARGING_MAX_STEPS; i++) {
-		rc = smblib_set_charge_param(chg, &chg->param.step_cc_delta[i],
-					     chg->step_cc_delta[i]);
-		if (rc < 0) {
-			pr_err("Couldn't configure cc delta rc = %d\n",
-				rc);
-			goto err_out;
-		}
-	}
-
-	rc = smblib_write(chg, STEP_CHG_UPDATE_REQUEST_TIMEOUT_CFG_REG,
-			  STEP_CHG_UPDATE_REQUEST_TIMEOUT_40S);
-	if (rc < 0) {
-		dev_err(chg->dev,
-			"Couldn't configure soc request timeout reg rc=%d\n",
-			 rc);
-		goto err_out;
-	}
-
-	rc = smblib_write(chg, STEP_CHG_UPDATE_FAIL_TIMEOUT_CFG_REG,
-			  STEP_CHG_UPDATE_FAIL_TIMEOUT_120S);
-	if (rc < 0) {
-		dev_err(chg->dev,
-			"Couldn't configure soc fail timeout reg rc=%d\n",
-			rc);
-		goto err_out;
-	}
-
-	/*
-	 *  enable step charging, source soc, standard mode, go to final
-	 *  state in case of failure.
-	 */
-	rc = smblib_write(chg, CHGR_STEP_CHG_MODE_CFG_REG,
-			       STEP_CHARGING_ENABLE_BIT |
-			       STEP_CHARGING_SOURCE_SELECT_BIT |
-			       STEP_CHARGING_SOC_FAIL_OPTION_BIT);
-	if (rc < 0) {
-		dev_err(chg->dev, "Couldn't configure charger rc=%d\n", rc);
-		goto err_out;
-	}
-
-	return 0;
-err_out:
-	chg->step_chg_enabled = false;
-	return rc;
-}
-#endif
 /********************
  * HELPER FUNCTIONS *
  ********************/
@@ -1902,31 +1776,6 @@ int smblib_get_prop_input_current_limited(struct smb_charger *chg,
 	return 0;
 }
 
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-int smblib_get_prop_step_chg_step(struct smb_charger *chg,
-				union power_supply_propval *val)
-{
-	int rc;
-	u8 stat;
-
-	if (!chg->step_chg_enabled) {
-		val->intval = -1;
-		return 0;
-	}
-
-	rc = smblib_read(chg, BATTERY_CHARGER_STATUS_1_REG, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read BATTERY_CHARGER_STATUS_1 rc=%d\n",
-			rc);
-		return rc;
-	}
-
-	val->intval = (stat & STEP_CHARGING_STATUS_MASK) >>
-				STEP_CHARGING_STATUS_SHIFT;
-
-	return rc;
-}
-#endif
 int smblib_get_prop_batt_charge_done(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -2319,16 +2168,6 @@ int smblib_get_prop_usb_present(struct smb_charger *chg,
 	}
 
 	val->intval = (bool)(stat & USBIN_PLUGIN_RT_STS_BIT);
-#if defined(CONFIG_NEO_DIRECT_CHARGE_SUPPORT)
-	rc = smblib_read(chg, PMI_GPIO3_STATUS, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read INT_RT_STS_OFFSET rc=%d\n",
-			rc);
-		return rc;
-	}
-
-	val->intval |= (bool)((stat & PMI_GPIO3_VAL_MASK) || chg->direct_irq_disabled);
-#endif
 	return 0;
 }
 
@@ -3279,215 +3118,6 @@ int smblib_get_charge_current(struct smb_charger *chg,
 	return 0;
 }
 
-#if defined(CONFIG_NEO_DIRECT_CHARGE_SUPPORT)
-static void smblib_handle_direct_charge_removal(struct smb_charger *chg)
-{
-	int rc;
-
-	vote(chg->apsd_rerun_votable, DC_USBIN_VOTER, false, 0);
-	vote(chg->apsd_disable_votable, DC_USBIN_VOTER, false, 0);
-	/* pull gpio6 output high */
-	rc = smblib_masked_write(chg, PMI_GPIO6_DIG_OUT_CTL, PMI_GPIO6_DIG_OUT_MASK, PMI_GPIO6_DIG_OUT_MASK);
-	if (rc < 0)
-		smblib_err(chg, "Couldn't set gpio6 output value, rc=%d\n", rc);
-	#if defined(CONFIG_DIRECT_QC_COMPATIBLE_FEATURE)
-		vote(chg->hvdcp_disable_votable_indirect, DC_USBIN_VOTER, true, 0);
-		rc = smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
-			HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT,
-			AUTO_SRC_DETECT_BIT);
-	#else
-		/* reset back to auto BC1.2 detection */
-		rc = smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
-			HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT,
-			HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT);
-	#endif
-	if (rc < 0)
-		smblib_err(chg, "Couldn't set auto src detect rc=%d\n", rc);
-}
-
-static void smblib_direct_chg_rerun_aicl_work(struct work_struct *work)
-{
-	int rc;
-	struct smb_charger *chg = container_of(work, struct smb_charger, rerun_aicl_work.work);
-
-	pr_err("%s():workqueue timer expired.\n", __func__);
-
-	if (chg->direct_irq_disabled){
-		chg->direct_irq_disabled = false;
-		enable_irq(chg->irq_info[USBIN_ICL_CHANGE_IRQ].irq);
-	}
-
-	/** Clear usb suspend bit, enable PMI switch charge */
-	rc = smblib_masked_write(chg, USBIN_CMD_IL_REG, USBIN_SUSPEND_BIT, 0);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't resume input rc=%d\n", rc);
-	}
-
-	/** Clear LEGACY_UNKNOWN_VOTER, make sure DCP_VOTER enable */
-	if (is_client_vote_enabled(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER)) {
-		pr_err("Legacy unknown voter enabled.\n");
-		vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, false, 0);
-	}
-
-	/** Set Max current to DCP ICL */
-	vote(chg->usb_icl_votable, DCP_VOTER, true, chg->dcp_icl_ua);
-
-	/** Force trigger AICL rerun */
-	rc = smblib_masked_write(chg, USBIN_AICL_OPTIONS_CFG_REG,
-                       USBIN_AICL_EN_BIT, 0);
-	if (rc < 0) {
-		pr_err("Couldn't cleart USBIN_AICL_EN_BIT rc=%d\n", rc);
-	}
-	msleep(100);
-	rc = smblib_masked_write(chg, USBIN_AICL_OPTIONS_CFG_REG,
-                       USBIN_AICL_EN_BIT, USBIN_AICL_EN_BIT);
-	if (rc < 0) {
-		pr_err("Couldn't set USBIN_AICL_EN_BIT rc=%d\n", rc);
-	}
-
-	smblib_rerun_aicl(chg);
-
-	power_supply_changed(chg->usb_main_psy);
-
-    return;
-}
-
-static int smblib_apsd_rerun_vote_callback(struct votable *votable,
-			void *data,
-			int apsd_rerun, const char *client)
-{
-	int rc;
-	struct smb_charger *chg = data;
-
-	if (apsd_rerun) {
-		/*
-		 * Disable the autonomous bit and auth bit for disabling hvdcp.
-		 * This ensures only qc 2.0 detection runs but no vbus
-		 * negotiation happens.
-		 */
-		rc = smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
-					 HVDCP_AUTH_ALG_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT,
-					 HVDCP_AUTH_ALG_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT);
-		if (rc < 0) {
-			smblib_err(chg, "Couldn't %s hvdcp rc=%d\n",
-				apsd_rerun ? "enable" : "disable", rc);
-			return rc;
-		}
-
-		/* vote to enable/disable HW autonomous INOV */
-		vote(chg->apsd_disable_votable, client, false, 0);
-		vote(chg->hvdcp_disable_votable_indirect, client, false, 0);
-
-		smblib_rerun_apsd(chg);
-	}
-
-	return 0;
-}
-
-static int smblib_direct_chg_enable_vote_callback(struct votable *votable,
-				void *data, int enable, const char *client)
-{
-	int rc;
-	u8 stat;
-	struct smb_charger *chg = data;
-
-	if (!chg->irq_info[USBIN_ICL_CHANGE_IRQ].irq)
-		return 0;
-
-	rc = smblib_read(chg, PMI_GPIO3_STATUS, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
-		return rc;
-	}
-
-	if (stat & PMI_GPIO3_VAL_MASK) {
-		vote(chg->apsd_disable_votable, DC_USBIN_VOTER, true, 0);
-		/** Disable HVDCP and APSD */
-		rc = smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
-			HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT, 0);
-		if (rc < 0)
-			smblib_err(chg, "Couldn't disable hvdcp rc=%d\n", rc);
-
-		/** Force HVDCP to 5V */
-		rc = smblib_write(chg, CMD_HVDCP_2_REG, FORCE_5V_BIT);
-		if (rc < 0)
-			smblib_err(chg, "Couldn't force 5V rc=%d\n", rc);
-
-		msleep(300);
-
-		/** APSD Done, Direct charger remove LEGACY_UNKNOWN_VOTER */
-		if (is_client_vote_enabled(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER)) {
-			vote(chg->usb_icl_votable, LEGACY_UNKNOWN_VOTER, false, 0);
-		}
-
-		/** Set Max current to DCP ICL */
-		vote(chg->usb_icl_votable, DCP_VOTER, true, chg->dcp_icl_ua);
-
-		/** Switch to PMI charging, set 2000ms delay to rerun aicl.*/
-		if (!enable) {
-			smblib_err(chg, "Start to switch PMI charging.\n");
-			cancel_delayed_work(&chg->rerun_aicl_work);
-			schedule_delayed_work(&chg->rerun_aicl_work, msecs_to_jiffies(2000));
-			return 0;
-		}
-	}
-
-	if (enable) {
-		if(!chg->direct_irq_disabled){
-			chg->direct_irq_disabled = true;
-			disable_irq_nosync(chg->irq_info[USBIN_ICL_CHANGE_IRQ].irq);
-		}
-		smblib_set_icl_current(chg, 0);
-	}
-	else {
-		if(chg->direct_irq_disabled) {
-			pr_err("Start to stop neo charging.\n");
-			chg->direct_irq_disabled = false;
-			kobject_uevent(&chg->usb_psy->dev.kobj, KOBJ_CHANGE);
-			enable_irq(chg->irq_info[USBIN_ICL_CHANGE_IRQ].irq);
-		}
-	}
-
-	rc = smblib_set_usb_suspend(chg, enable);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't resume input rc=%d\n", rc);
-		return rc;
-	}
-
-	return 0;
-}
-
-static void smblib_handle_direct_charge_detection(struct smb_charger *chg)
-{
-	int rc;
-	u8 stat;
-	const union power_supply_propval val = {1, };
-
-	rc = smblib_read(chg, PMI_GPIO3_STATUS, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
-		return;
-	}
-
-	/* Disable HVDCP and APSD */
-	if (stat & PMI_GPIO3_VAL_MASK) {
-		smblib_err(chg, "direct charge has been enabled.\n");
-		return;
-	}
-
-	/* force HVDCP to 5V */
-	smblib_masked_write(chg, USBIN_OPTIONS_1_CFG_REG,
-		HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT | AUTO_SRC_DETECT_BIT, 0);
-	smblib_write(chg, CMD_HVDCP_2_REG, FORCE_5V_BIT);
-
-	if (chg->direct_psy == NULL)
-		chg->direct_psy = power_supply_get_by_name("neo-charger");
-
-	if (chg->direct_psy != NULL)
-		power_supply_set_property(chg->direct_psy, POWER_SUPPLY_PROP_CHARGING_ENABLED, &val);
-}
-#endif
-
 /************************
  * PARALLEL PSY GETTERS *
  ************************/
@@ -3565,59 +3195,6 @@ irqreturn_t smblib_handle_chg_state_change(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-irqreturn_t smblib_handle_step_chg_state_change(int irq, void *data)
-{
-	struct smb_irq_data *irq_data = data;
-	struct smb_charger *chg = irq_data->parent_data;
-
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
-
-	if (chg->step_chg_enabled)
-		rerun_election(chg->fcc_votable);
-
-	return IRQ_HANDLED;
-}
-
-irqreturn_t smblib_handle_step_chg_soc_update_fail(int irq, void *data)
-{
-	struct smb_irq_data *irq_data = data;
-	struct smb_charger *chg = irq_data->parent_data;
-
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
-
-	if (chg->step_chg_enabled)
-		rerun_election(chg->fcc_votable);
-
-	return IRQ_HANDLED;
-}
-
-#define STEP_SOC_REQ_MS	3000
-irqreturn_t smblib_handle_step_chg_soc_update_request(int irq, void *data)
-{
-	struct smb_irq_data *irq_data = data;
-	struct smb_charger *chg = irq_data->parent_data;
-	int rc;
-	union power_supply_propval pval = {0, };
-
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
-
-	if (!chg->bms_psy) {
-		schedule_delayed_work(&chg->step_soc_req_work,
-				      msecs_to_jiffies(STEP_SOC_REQ_MS));
-		return IRQ_HANDLED;
-	}
-
-	rc = smblib_get_prop_batt_capacity(chg, &pval);
-	if (rc < 0)
-		smblib_err(chg, "Couldn't get batt capacity rc=%d\n", rc);
-	else
-		step_charge_soc_update(chg, pval.intval);
-
-	return IRQ_HANDLED;
-}
-#endif
-
 irqreturn_t smblib_handle_batt_temp_changed(int irq, void *data)
 {
 	struct smb_irq_data *irq_data = data;
@@ -3668,18 +3245,6 @@ irqreturn_t smblib_handle_usbin_uv(int irq, void *data)
 
 	wdata = &chg->irq_info[SWITCH_POWER_OK_IRQ].irq_data->storm_data;
 	reset_storm_count(wdata);
-	return IRQ_HANDLED;
-}
-
-irqreturn_t smblib_handle_usbin_ov(int irq, void *data)
-{
-	struct smb_irq_data *irq_data = data;
-	struct smb_charger *chg = irq_data->parent_data;
-
-	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
-	if (chg->batt_psy)
-		power_supply_changed(chg->batt_psy);
-
 	return IRQ_HANDLED;
 }
 
@@ -3736,7 +3301,6 @@ void smblib_usb_plugin_hard_reset_locked(struct smb_charger *chg)
 }
 
 #define PL_DELAY_MS			30000
-#define TYPEC_DISABLE_CMD_DELAY_MS	200
 void smblib_usb_plugin_locked(struct smb_charger *chg)
 {
 	int rc;
@@ -4567,135 +4131,6 @@ static void smblib_handle_typec_insertion(struct smb_charger *chg)
 	}
 }
 
-#if defined(CONFIG_TYPEC_AUDIO_ADAPTER_SWITCH)
-static int smblib_init_sink_audio_adapter(struct smb_charger *chg)
-{
-	int rc;
-	struct device_node *node = chg->dev->of_node;
-
-	if (!node) {
-		pr_err("device tree node missing\n");
-		return -EINVAL;
-	}
-
-	/** Swich enable, active high level. */
-	if (gpio_is_valid(chg->switch_en)) {
-		rc = devm_gpio_request(chg->dev, chg->switch_en, "switch_enable");
-		if (rc) {
-			pr_err("request switch_enable gpio failed, rc=%d\n", rc);
-			goto switch_en_gpio_err;
-		}
-	}
-	/** USB-Audio switch select, 0:audio mode, 1:usb mode.*/
-	if (gpio_is_valid(chg->switch_select)) {
-		rc = devm_gpio_request(chg->dev, chg->switch_select, "switch_select");
-		if (rc) {
-			pr_err("request switch_select gpio failed, rc=%d\n", rc);
-			goto switch_select_gpio_err;
-		}
-	}
-	/** Codec headsets detect pin, avtive low level.*/
-	if (gpio_is_valid(chg->mbhc_int)) {
-        rc = devm_gpio_request(chg->dev, chg->mbhc_int, "mbhc_int");
-		if (rc) {
-			pr_err("request mbhc_int gpio failed, rc=%d\n", rc);
-			goto mbhc_int_gpio_err;
-		}
-    }
-
-	/** Configuration GPIO to default value */
-	rc = gpio_direction_output(chg->switch_en, 0);
-	if (rc) {
-		smblib_err(chg, "Set switch_en gpio output fail.\n");
-	}
-
-	rc = gpio_direction_output(chg->switch_select, 0);
-	if (rc) {
-        smblib_err(chg, "Set switch_select gpio output fail.\n");
-    }
-
-	rc = gpio_direction_output(chg->mbhc_int, 1);
-	if (rc) {
-        smblib_err(chg, "Set mbhc_int gpio output fail.\n");
-    }
-
-	return 0;
-
-mbhc_int_gpio_err:
-	if (gpio_is_valid(chg->switch_select))
-		gpio_free(chg->switch_select);
-switch_select_gpio_err:
-	if (gpio_is_valid(chg->switch_en))
-		gpio_free(chg->switch_en);
-switch_en_gpio_err:
-	return rc;
-}
-
-static void smblib_deinit_sink_audio_adapter(struct smb_charger *chg)
-{
-	smblib_err(chg, "Error occurred while deinit sink audio.\n");
-
-	if (gpio_is_valid(chg->switch_select))
-		gpio_free(chg->switch_select);
-
-	if (gpio_is_valid(chg->switch_en))
-		gpio_free(chg->switch_en);
-
-	if (gpio_is_valid(chg->mbhc_int))
-		gpio_free(chg->mbhc_int);
-}
-
-static int smblib_set_sink_audio_adapter(struct smb_charger *chg, int enable)
-{
-	int ret;
-
-	smblib_err(chg, "Set audio to %s\n", enable ? "enable" : "disable");
-
-	if (gpio_is_valid(chg->mbhc_int)) {
-        ret = gpio_direction_output(chg->mbhc_int, !enable);
-		if (ret) {
-			smblib_err(chg, "Set mbhc_int output fail.\n");
-		}
-		smblib_err(chg, "Current mbhc_int gpio status:%d\n", gpio_get_value(chg->mbhc_int));
-	}
-
-	if (gpio_is_valid(chg->switch_select)) {
-        ret = gpio_direction_output(chg->switch_select, enable);
-		if (ret) {
-			smblib_err(chg, "Set switch_select output fail.\n");
-		}
-		smblib_err(chg, "Current switch_select gpio status:%d\n", gpio_get_value(chg->switch_select));
-	}
-
-	return 0;
-}
-
-static int smblib_handle_sink_audio_adapter(struct smb_charger *chg)
-{
-	int rc;
-	u8 stat;
-
-	rc = smblib_read(chg, TYPE_C_STATUS_2_REG, &stat);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't read TYPE_C_STATUS_2 rc=%d\n", rc);
-		return rc;
-	}
-	pr_err("TYPE_C_STATUS_2 = 0x%02x\n", stat);
-
-	/* Set Switch select to USB as default */
-	if (gpio_is_valid(chg->switch_select) && gpio_get_value(chg->switch_select)) {
-		smblib_set_sink_audio_adapter(chg, 0);
-	}
-
-	/* Set to Audio mode, when RARA on CC1/CC2 */
-	if (stat & DFP_RA_RA_BIT) {
-		smblib_set_sink_audio_adapter(chg, 1);
-	}
-
-	return 0;
-}
-#endif
-
 static void smblib_handle_rp_change(struct smb_charger *chg, int typec_mode)
 {
 	int rp_ua;
@@ -4807,11 +4242,7 @@ irqreturn_t smblib_handle_usb_typec_change(int irq, void *data)
 			"cc2_detach_wa" : "typec_en_dis");
 		return IRQ_HANDLED;
 	}
-#if defined(CONFIG_TYPEC_AUDIO_ADAPTER_SWITCH)
-	if(chg->usb_audio_select_supported){
-		smblib_handle_sink_audio_adapter(chg);
-	}
-#endif
+
 	mutex_lock(&chg->lock);
 	smblib_usb_typec_change(chg);
 	mutex_unlock(&chg->lock);
@@ -4855,6 +4286,9 @@ static void smblib_bb_removal_work(struct work_struct *work)
 	vote(chg->awake_votable, BOOST_BACK_VOTER, false, 0);
 }
 
+#define BOOST_BACK_UNVOTE_DELAY_MS		750
+#define BOOST_BACK_STORM_COUNT			3
+#define WEAK_CHG_STORM_COUNT			8
 irqreturn_t smblib_handle_switcher_power_ok(int irq, void *data)
 {
 	struct smb_irq_data *irq_data = data;
@@ -5008,24 +4442,6 @@ static void bms_update_work(struct work_struct *work)
 	if (chg->batt_psy)
 		power_supply_changed(chg->batt_psy);
 }
-
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-static void step_soc_req_work(struct work_struct *work)
-{
-	struct smb_charger *chg = container_of(work, struct smb_charger,
-						step_soc_req_work.work);
-	union power_supply_propval pval = {0, };
-	int rc;
-
-	rc = smblib_get_prop_batt_capacity(chg, &pval);
-	if (rc < 0) {
-		smblib_err(chg, "Couldn't get batt capacity rc=%d\n", rc);
-		return;
-	}
-
-	step_charge_soc_update(chg, pval.intval);
-}
-#endif
 
 static void clear_hdc_work(struct work_struct *work)
 {
@@ -5457,26 +4873,6 @@ static int smblib_create_votables(struct smb_charger *chg)
 		return rc;
 	}
 
-#if defined(CONFIG_NEO_DIRECT_CHARGE_SUPPORT)
-	chg->apsd_rerun_votable = create_votable(
-				"APSD_RERUN",
-				VOTE_SET_ANY,
-				smblib_apsd_rerun_vote_callback,
-				chg);
-	if (IS_ERR(chg->apsd_rerun_votable)) {
-		rc = PTR_ERR(chg->apsd_rerun_votable);
-		return rc;
-	}
-
-	chg->direct_chg_enable_votable = create_votable("DIRECT_CHG_ENABLE",
-					VOTE_SET_ANY,
-					smblib_direct_chg_enable_vote_callback,
-					chg);
-	if (IS_ERR(chg->direct_chg_enable_votable)) {
-		rc = PTR_ERR(chg->direct_chg_enable_votable);
-		return rc;
-	}
-#endif
 
 	chg->hvdcp_disable_votable_indirect = create_votable(
 				"HVDCP_DISABLE_INDIRECT",
@@ -5585,9 +4981,6 @@ int smblib_init(struct smb_charger *chg)
 	INIT_WORK(&chg->bms_update_work, bms_update_work);
 	INIT_WORK(&chg->rdstd_cc2_detach_work, rdstd_cc2_detach_work);
 	INIT_DELAYED_WORK(&chg->hvdcp_detect_work, smblib_hvdcp_detect_work);
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-	INIT_DELAYED_WORK(&chg->step_soc_req_work, step_soc_req_work);
-#endif
 	INIT_DELAYED_WORK(&chg->clear_hdc_work, clear_hdc_work);
 	INIT_WORK(&chg->otg_oc_work, smblib_otg_oc_work);
 	INIT_WORK(&chg->vconn_oc_work, smblib_vconn_oc_work);
@@ -5608,7 +5001,7 @@ int smblib_init(struct smb_charger *chg)
 				rc);
 			return rc;
 		}
-	#if !defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+
 		rc = qcom_step_chg_init(chg->step_chg_enabled,
 						chg->sw_jeita_enabled);
 		if (rc < 0) {
@@ -5616,7 +5009,7 @@ int smblib_init(struct smb_charger *chg)
 				rc);
 			return rc;
 		}
-	#endif
+
 		rc = smblib_create_votables(chg);
 		if (rc < 0) {
 			smblib_err(chg, "Couldn't create votables rc=%d\n",
@@ -5633,11 +5026,6 @@ int smblib_init(struct smb_charger *chg)
 
 		chg->bms_psy = power_supply_get_by_name("bms");
 		chg->pl.psy = power_supply_get_by_name("parallel");
-	#if defined(CONFIG_TYPEC_AUDIO_ADAPTER_SWITCH)
-		if(chg->usb_audio_select_supported){
-			smblib_init_sink_audio_adapter(chg);
-		}
-	#endif
 		break;
 	case PARALLEL_SLAVE:
 		break;
@@ -5656,9 +5044,6 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_work_sync(&chg->bms_update_work);
 		cancel_work_sync(&chg->rdstd_cc2_detach_work);
 		cancel_delayed_work_sync(&chg->hvdcp_detect_work);
-#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
-		cancel_delayed_work_sync(&chg->step_soc_req_work);
-#endif
 		cancel_delayed_work_sync(&chg->clear_hdc_work);
 		cancel_work_sync(&chg->otg_oc_work);
 		cancel_work_sync(&chg->vconn_oc_work);
@@ -5670,9 +5055,7 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_delayed_work_sync(&chg->bb_removal_work);
 		power_supply_unreg_notifier(&chg->nb);
 		smblib_destroy_votables(chg);
-	#if !defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
 		qcom_step_chg_deinit();
-	#endif
 		qcom_batt_deinit();
 		break;
 	case PARALLEL_SLAVE:
@@ -5684,10 +5067,5 @@ int smblib_deinit(struct smb_charger *chg)
 
 	smblib_iio_deinit(chg);
 
-#if defined(CONFIG_TYPEC_AUDIO_ADAPTER_SWITCH)
-	if(chg->usb_audio_select_supported){
-		smblib_deinit_sink_audio_adapter(chg);
-	}
-#endif
 	return 0;
 }
