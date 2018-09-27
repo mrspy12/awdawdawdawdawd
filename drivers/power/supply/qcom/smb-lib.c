@@ -374,6 +374,30 @@ int smblib_set_charge_param(struct smb_charger *chg,
 	return rc;
 }
 
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+static int step_charge_soc_update(struct smb_charger *chg, int capacity)
+{
+	int rc = 0;
+
+	rc = smblib_set_charge_param(chg, &chg->param.step_soc, capacity);
+	if (rc < 0) {
+		smblib_err(chg, "Error in updating soc, rc=%d\n", rc);
+		return rc;
+	}
+
+	rc = smblib_write(chg, STEP_CHG_SOC_VBATT_V_UPDATE_REG,
+			STEP_CHG_SOC_VBATT_V_UPDATE_BIT);
+	if (rc < 0) {
+		smblib_err(chg,
+			"Couldn't set STEP_CHG_SOC_VBATT_V_UPDATE_REG rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	return rc;
+}
+#endif
+
 int smblib_set_usb_suspend(struct smb_charger *chg, bool suspend)
 {
 	int rc = 0;
@@ -487,6 +511,80 @@ static int smblib_set_usb_pd_allowed_voltage(struct smb_charger *chg,
 	return rc;
 }
 
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+#define STEP_CHARGING_MAX_STEPS	5
+int smblib_config_step_charging(struct smb_charger *chg, int enable)
+{
+	int rc = 0;
+	int i;
+
+	if(chg->mode != PARALLEL_MASTER)
+		return rc;
+
+	smblib_dbg(chg, PR_INTERRUPT, "Step charging has been %sd.\n", enable ? "enable" : "disable");
+	chg->step_chg_enabled = enable;
+
+	if(!chg->step_chg_enabled)
+		return rc;
+
+	for (i = 0; i < STEP_CHARGING_MAX_STEPS - 1; i++) {
+		rc = smblib_set_charge_param(chg,
+					     &chg->param.step_soc_threshold[i],
+					     chg->step_soc_threshold[i]);
+		if (rc < 0) {
+			pr_err("Couldn't configure soc thresholds rc = %d\n",
+				rc);
+			goto err_out;
+		}
+	}
+
+	for (i = 0; i < STEP_CHARGING_MAX_STEPS; i++) {
+		rc = smblib_set_charge_param(chg, &chg->param.step_cc_delta[i],
+					     chg->step_cc_delta[i]);
+		if (rc < 0) {
+			pr_err("Couldn't configure cc delta rc = %d\n",
+				rc);
+			goto err_out;
+		}
+	}
+
+	rc = smblib_write(chg, STEP_CHG_UPDATE_REQUEST_TIMEOUT_CFG_REG,
+			  STEP_CHG_UPDATE_REQUEST_TIMEOUT_40S);
+	if (rc < 0) {
+		dev_err(chg->dev,
+			"Couldn't configure soc request timeout reg rc=%d\n",
+			 rc);
+		goto err_out;
+	}
+
+	rc = smblib_write(chg, STEP_CHG_UPDATE_FAIL_TIMEOUT_CFG_REG,
+			  STEP_CHG_UPDATE_FAIL_TIMEOUT_120S);
+	if (rc < 0) {
+		dev_err(chg->dev,
+			"Couldn't configure soc fail timeout reg rc=%d\n",
+			rc);
+		goto err_out;
+	}
+
+	/*
+	 *  enable step charging, source soc, standard mode, go to final
+	 *  state in case of failure.
+	 */
+	rc = smblib_write(chg, CHGR_STEP_CHG_MODE_CFG_REG,
+			       STEP_CHARGING_ENABLE_BIT |
+			       STEP_CHARGING_SOURCE_SELECT_BIT |
+			       STEP_CHARGING_SOC_FAIL_OPTION_BIT);
+	if (rc < 0) {
+		dev_err(chg->dev, "Couldn't configure charger rc=%d\n", rc);
+		goto err_out;
+	}
+
+	return 0;
+err_out:
+	chg->step_chg_enabled = false;
+	return rc;
+}
+#endif
 /********************
  * HELPER FUNCTIONS *
  ********************/
@@ -1776,6 +1874,31 @@ int smblib_get_prop_input_current_limited(struct smb_charger *chg,
 	return 0;
 }
 
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+int smblib_get_prop_step_chg_step(struct smb_charger *chg,
+				union power_supply_propval *val)
+{
+	int rc;
+	u8 stat;
+
+	if (!chg->step_chg_enabled) {
+		val->intval = -1;
+		return 0;
+	}
+
+	rc = smblib_read(chg, BATTERY_CHARGER_STATUS_1_REG, &stat);
+	if (rc < 0) {
+		smblib_err(chg, "Couldn't read BATTERY_CHARGER_STATUS_1 rc=%d\n",
+			rc);
+		return rc;
+	}
+
+	val->intval = (stat & STEP_CHARGING_STATUS_MASK) >>
+				STEP_CHARGING_STATUS_SHIFT;
+
+	return rc;
+}
+#endif
 int smblib_get_prop_batt_charge_done(struct smb_charger *chg,
 					union power_supply_propval *val)
 {
@@ -3195,6 +3318,59 @@ irqreturn_t smblib_handle_chg_state_change(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+irqreturn_t smblib_handle_step_chg_state_change(int irq, void *data)
+{
+	struct smb_irq_data *irq_data = data;
+	struct smb_charger *chg = irq_data->parent_data;
+
+	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+
+	if (chg->step_chg_enabled)
+		rerun_election(chg->fcc_votable);
+
+	return IRQ_HANDLED;
+}
+
+irqreturn_t smblib_handle_step_chg_soc_update_fail(int irq, void *data)
+{
+	struct smb_irq_data *irq_data = data;
+	struct smb_charger *chg = irq_data->parent_data;
+
+	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+
+	if (chg->step_chg_enabled)
+		rerun_election(chg->fcc_votable);
+
+	return IRQ_HANDLED;
+}
+
+#define STEP_SOC_REQ_MS	3000
+irqreturn_t smblib_handle_step_chg_soc_update_request(int irq, void *data)
+{
+	struct smb_irq_data *irq_data = data;
+	struct smb_charger *chg = irq_data->parent_data;
+	int rc;
+	union power_supply_propval pval = {0, };
+
+	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+
+	if (!chg->bms_psy) {
+		schedule_delayed_work(&chg->step_soc_req_work,
+				      msecs_to_jiffies(STEP_SOC_REQ_MS));
+		return IRQ_HANDLED;
+	}
+
+	rc = smblib_get_prop_batt_capacity(chg, &pval);
+	if (rc < 0)
+		smblib_err(chg, "Couldn't get batt capacity rc=%d\n", rc);
+	else
+		step_charge_soc_update(chg, pval.intval);
+
+	return IRQ_HANDLED;
+}
+#endif
+
 irqreturn_t smblib_handle_batt_temp_changed(int irq, void *data)
 {
 	struct smb_irq_data *irq_data = data;
@@ -4576,6 +4752,24 @@ static void bms_update_work(struct work_struct *work)
 		power_supply_changed(chg->batt_psy);
 }
 
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+static void step_soc_req_work(struct work_struct *work)
+{
+	struct smb_charger *chg = container_of(work, struct smb_charger,
+						step_soc_req_work.work);
+	union power_supply_propval pval = {0, };
+	int rc;
+
+	rc = smblib_get_prop_batt_capacity(chg, &pval);
+	if (rc < 0) {
+		smblib_err(chg, "Couldn't get batt capacity rc=%d\n", rc);
+		return;
+	}
+
+	step_charge_soc_update(chg, pval.intval);
+}
+#endif
+
 static void clear_hdc_work(struct work_struct *work)
 {
 	struct smb_charger *chg = container_of(work, struct smb_charger,
@@ -5114,6 +5308,9 @@ int smblib_init(struct smb_charger *chg)
 	INIT_WORK(&chg->bms_update_work, bms_update_work);
 	INIT_WORK(&chg->rdstd_cc2_detach_work, rdstd_cc2_detach_work);
 	INIT_DELAYED_WORK(&chg->hvdcp_detect_work, smblib_hvdcp_detect_work);
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+	INIT_DELAYED_WORK(&chg->step_soc_req_work, step_soc_req_work);
+#endif
 	INIT_DELAYED_WORK(&chg->clear_hdc_work, clear_hdc_work);
 	INIT_WORK(&chg->otg_oc_work, smblib_otg_oc_work);
 	INIT_WORK(&chg->vconn_oc_work, smblib_vconn_oc_work);
@@ -5134,7 +5331,7 @@ int smblib_init(struct smb_charger *chg)
 				rc);
 			return rc;
 		}
-
+	#if !defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
 		rc = qcom_step_chg_init(chg->step_chg_enabled,
 						chg->sw_jeita_enabled);
 		if (rc < 0) {
@@ -5142,7 +5339,7 @@ int smblib_init(struct smb_charger *chg)
 				rc);
 			return rc;
 		}
-
+	#endif
 		rc = smblib_create_votables(chg);
 		if (rc < 0) {
 			smblib_err(chg, "Couldn't create votables rc=%d\n",
@@ -5182,6 +5379,9 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_work_sync(&chg->bms_update_work);
 		cancel_work_sync(&chg->rdstd_cc2_detach_work);
 		cancel_delayed_work_sync(&chg->hvdcp_detect_work);
+#if defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
+		cancel_delayed_work_sync(&chg->step_soc_req_work);
+#endif
 		cancel_delayed_work_sync(&chg->clear_hdc_work);
 		cancel_work_sync(&chg->otg_oc_work);
 		cancel_work_sync(&chg->vconn_oc_work);
@@ -5193,7 +5393,9 @@ int smblib_deinit(struct smb_charger *chg)
 		cancel_delayed_work_sync(&chg->bb_removal_work);
 		power_supply_unreg_notifier(&chg->nb);
 		smblib_destroy_votables(chg);
+	#if !defined(CONFIG_NUBIA_HW_STEP_CHARGE_FEATURE)
 		qcom_step_chg_deinit();
+	#endif
 		qcom_batt_deinit();
 		break;
 	case PARALLEL_SLAVE:
