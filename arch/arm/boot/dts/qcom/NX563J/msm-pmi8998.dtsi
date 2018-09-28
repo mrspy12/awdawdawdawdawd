@@ -166,9 +166,9 @@
 			qcom,step-soc-thresholds = <60 70 80 90>;
 			qcom,step-current-deltas = <950000 950000 0 0 0>;
 
-			qcom,fcc-max-ua = <2150000>;
+			/*qcom,fcc-max-ua = <2150000>;
 			qcom,fv-max-uv = <4400000>;
-			qcom,usb-icl-ua = <2000000>;
+			qcom,usb-icl-ua = <2000000>;*/
 
 			io-channels = <&pmi8998_rradc 8>,
 				      <&pmi8998_rradc 10>,
